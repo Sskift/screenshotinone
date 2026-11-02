@@ -174,6 +174,20 @@ class SteamBridgeTests(unittest.TestCase):
         self.assertEqual(shot.ugc_id, "123456789012345678")
         self.assertIsNone(shot.published_file_id)
 
+    def test_native_invalid_ugc_sentinel_never_confirms_an_upload(self):
+        for uploaded in (False, True):
+            with self.subTest(uploaded=uploaded):
+                self.cdp.rows[0].update(bUploaded=uploaded, ugcHandle="18446744073709551615", publishedFileID="0")
+                shot = self.bridge.get_screenshot("570", 1)
+                self.assertEqual(shot.uploaded, uploaded)
+                self.assertIsNone(shot.ugc_id)
+                self.assertIsNone(shot.published_file_id)
+
+    def test_invalid_maximum_published_id_is_rejected(self):
+        self.cdp.rows[0].update(publishedFileID="18446744073709551615")
+        with self.assertRaises(SteamBridgeError):
+            self.bridge.get_screenshot("570", 1)
+
     def test_publish_revalidates_identity_and_uses_native_privacy_values(self):
         shot = self.bridge.get_screenshot("570", 1)
         for name, value in [("private", 2), ("friends", 4), ("public", 8), ("unlisted", 16)]:

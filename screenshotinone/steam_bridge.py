@@ -268,7 +268,13 @@ class SteamBridge:
             if value is None or value == "" or value == "0" or (type(value) is int and value == 0):
                 identifiers[field] = None
                 continue
-            identifiers[field] = _decimal(value, label, 2**64 - 1)
+            # Steam uses k_UGCHandleInvalid (UINT64_MAX) on local screenshots
+            # that have no cloud content handle. It is never upload evidence,
+            # including when bUploaded has an inconsistent true value.
+            if field == "ugcHandle" and value == str(2**64 - 1):
+                identifiers[field] = None
+                continue
+            identifiers[field] = _decimal(value, label, 2**64 - 2)
         privacy = row.get("ePrivacy")
         if privacy is not None and (isinstance(privacy, bool) or not isinstance(privacy, int)):
             raise SteamBridgeError("Steam returned an invalid screenshot privacy state")
