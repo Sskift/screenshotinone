@@ -46,6 +46,7 @@ class SteamSyncReport:
     errors: list[str] = field(default_factory=list)
     planned: list[str] = field(default_factory=list)
     links: list[str] = field(default_factory=list)
+    scan_failed: bool = False
 
 
 def _path_key(path: Path) -> str:
@@ -186,6 +187,40 @@ def steam_queue_status(state_path: Path, account_id: str | None = None) -> dict[
         }
 
 
+def steam_retry_needed(
+    state_path: Path, account_id: str | None = None, *, roots: Iterable[Path] | None = None
+) -> bool:
+    """Return whether queued work needs another attempt or reconciliation.
+
+    This reads committed SQLite state without creating a database or lock file.
+    ``publishing`` and ``uncertain`` require reconciliation, never blind replay.
+    Missing databases return False; unreadable or incompatible databases raise
+    their SQLite error so callers do not mistake unknown state for an empty queue.
+    When roots are supplied, stale work belonging to other Steam installations
+    is excluded. An explicitly empty roots collection selects no work.
+    """
+    prefixes = None if roots is None else sorted({
+        _path_key(Path(root) / "userdata") + os.sep for root in roots
+    })
+    if prefixes == []:
+        return False
+    path = Path(state_path).expanduser().resolve()
+    with _Queue(path, readonly=True) as queue:
+        if queue.connection is None:
+            return False
+        query = "SELECT 1 FROM steam_queue WHERE status IN ('queued', 'publishing', 'uncertain')"
+        parameters: list[str] = []
+        if account_id is not None:
+            query += " AND account_id = ?"
+            parameters.append(account_id)
+        if prefixes is not None:
+            # instr performs a literal, case-sensitive prefix check. Both sides
+            # use _path_key normalization; '%' and '_' remain ordinary names.
+            query += " AND (" + " OR ".join("instr(source_key, ?) = 1" for _ in prefixes) + ")"
+            parameters.extend(prefixes)
+        return queue.connection.execute(query + " LIMIT 1", parameters).fetchone() is not None
+
+
 def _validate_native(shot: Any, entry: dict[str, Any], *, handle: int | None = None) -> None:
     game_id = getattr(shot, "game_id", getattr(shot, "str_game_id", None))
     if getattr(shot, "account_id", None) != entry["account_id"]:
@@ -307,7 +342,7 @@ def steam_sync_once(
         root_list,
         on_error=lambda path, error: report.errors.append(f"Cannot scan {path}: {error}"),
     )
-    scan_failed = bool(report.errors)
+    scan_failed = report.scan_failed = bool(report.errors)
     sources = [source for source in sources if source.account_id == account_id]
     selected_key = _path_key(only_path) if only_path is not None else None
     if selected_key is not None:

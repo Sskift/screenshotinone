@@ -1,4 +1,4 @@
-"""Command line entry point and a quiet, polling background worker."""
+"""One-shot sync commands, native watcher integration, and portable polling."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import dataclasses
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+import math
 import signal
 import sqlite3
 import sys
@@ -40,6 +41,8 @@ def _parser() -> argparse.ArgumentParser:
     sync = commands.add_parser("sync", help="Run one synchronization pass")
     sync.add_argument("--dry-run", action="store_true", help="Plan without uploading or changing state")
     commands.add_parser("watch", help="Poll for new screenshots; retry failed files on later passes")
+    commands.add_parser("watch-plan", help="Read Windows event-watcher settings without syncing")
+    commands.add_parser("event-sync", help="Run one event-triggered pass; exit 10 when a retry is needed")
     commands.add_parser("status", help="Show source counts and local worker log location")
     steam = commands.add_parser("steam", help="Experimental Steam Community publication through the local Steam client")
     steam_commands = steam.add_subparsers(dest="steam_command", required=True)
@@ -95,6 +98,23 @@ def _roots(config: Config | None) -> list[Path]:
 
 def _target(config: Config):
     return NetclipTarget(**config.target_options) if config.target_type == "netclip" else FolderTarget(**config.target_options)
+
+
+def _watch_plan(config: Config) -> dict:
+    # Include a small margin so filesystem timestamps and event delivery cannot
+    # launch the worker just before the source's settling deadline.
+    if config.settle_seconds > (2_147_483_647 - 250) / 1000:
+        raise ValueError("settle_seconds is too large for the Windows event watcher")
+    debounce_ms = max(250, math.ceil(config.settle_seconds * 1000) + 250)
+    return {"roots": [str(root / "userdata") for root in _roots(config)],
+            "debounce_ms": debounce_ms,
+            "enabled": bool(config.target_enabled or (config.steam and config.steam.enabled))}
+
+
+def _retryable_exception(error: Exception) -> bool:
+    return (isinstance(error, (OSError, RuntimeError))
+            or isinstance(error, sqlite3.OperationalError)
+            and any(word in str(error).lower() for word in ("locked", "busy")))
 
 
 def _steam_pass(config: Config, *, dry_run: bool = False, include_existing: bool = False,
@@ -178,7 +198,7 @@ def _logger(config: Config) -> logging.Logger:
     return logger
 
 
-def _run(config: Config, *, watch: bool, dry_run: bool = False) -> int:
+def _run(config: Config, *, watch: bool, dry_run: bool = False, event: bool = False) -> int:
     logger = _logger(config) if not dry_run else None
     roots = _roots(config)
     target = _target(config) if config.target_enabled else None
@@ -191,6 +211,7 @@ def _run(config: Config, *, watch: bool, dry_run: bool = False) -> int:
     while True:
         summary = {"dry_run": dry_run, "target_enabled": config.target_enabled}
         exit_code = 0
+        retry_needed = False
         changed = False
         if target is not None:
             try:
@@ -201,10 +222,12 @@ def _run(config: Config, *, watch: bool, dry_run: bool = False) -> int:
                 if folder_url:
                     summary["folder_url"] = folder_url
                 exit_code = 1 if report.errors else 0
+                retry_needed = bool(report.pending or report.errors)
                 changed = bool(report.uploaded)
             except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
                 summary["errors"] = [str(exc)]
                 exit_code = 1
+                retry_needed = _retryable_exception(exc)
         if config.steam and config.steam.enabled:
             try:
                 steam_report = _steam_pass(config, dry_run=dry_run)
@@ -212,16 +235,25 @@ def _run(config: Config, *, watch: bool, dry_run: bool = False) -> int:
                 changed = changed or bool(steam_report.uploaded)
                 if steam_report.errors or steam_report.uncertain:
                     exit_code = 1
+                if event:
+                    from .steam_sync import steam_retry_needed
+
+                    retry_needed = retry_needed or bool(
+                        steam_report.pending or steam_report.uncertain or steam_report.scan_failed
+                        or steam_retry_needed(config.steam.state_path, config.steam.account_id, roots=roots))
             except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
                 summary["steam"] = {"errors": [str(exc)]}
                 exit_code = 1
+                retry_needed = retry_needed or _retryable_exception(exc)
+        if event:
+            summary["retry_needed"] = retry_needed
         if not watch or summary != last_summary or changed:
             _print(summary)
             if logger:
                 logger.info("Sync: %s", json.dumps(summary, ensure_ascii=False, default=str))
         last_summary = summary
         if not watch:
-            return exit_code
+            return 10 if event and retry_needed else exit_code
         if stop.wait(config.poll_interval):
             logger.info("Worker stopped")
             return 0
@@ -246,6 +278,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if config is None:
             raise ValueError(f"Configuration not found: {args.config}. Run init first.")
+        if args.command == "watch-plan":
+            _print(_watch_plan(config))
+            return 0
         if args.command == "status":
             roots = _roots(config)
             _print({"version": __version__, "config": config.path, "steam_roots": roots,
@@ -255,11 +290,12 @@ def main(argv: list[str] | None = None) -> int:
                     "log_path": config.log_path, "poll_interval": config.poll_interval,
                     "steam_enabled": bool(config.steam and config.steam.enabled)})
             return 0
-        return _run(config, watch=args.command == "watch", dry_run=getattr(args, "dry_run", False))
+        return _run(config, watch=args.command == "watch", dry_run=getattr(args, "dry_run", False),
+                    event=args.command == "event-sync")
     except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
         if sys.stderr is not None:
             print(f"screenshotinone: {exc}", file=sys.stderr)
-        if args.command == "watch":
+        if args.command in {"watch", "event-sync"}:
             # pythonw has no stderr: persist bootstrap errors as well as pass errors.
             try:
                 if config is not None:

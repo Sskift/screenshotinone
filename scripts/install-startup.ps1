@@ -5,8 +5,9 @@ Run screenshotinone silently at Windows user logon.
 .EXAMPLE
 .\scripts\install-startup.ps1 -ConfigPath .\config.json -StartNow
 .NOTES
-Uses the current user's interactive token and pythonw.exe. It does not request
-administrator privileges, create a console, or store a Windows password.
+Builds a small native filesystem watcher before replacing the startup task.
+The watcher starts pythonw.exe only when synchronization is needed. Uses the
+current user's interactive token without a console, elevation, or a password.
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
@@ -24,6 +25,19 @@ param(
 $ErrorActionPreference = 'Stop'
 $ownerMarker = 'Managed by screenshotinone (https://github.com/Sskift/screenshotinone).'
 
+function ConvertTo-TaskPath {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    if ($Value -match '[\x00-\x1f\x7f"]' -or $Value -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+\\)') {
+        throw 'Task paths must be absolute Windows paths without quotes or control characters.'
+    }
+    $fullPath = [IO.Path]::GetFullPath($Value)
+    if ($fullPath -ieq [IO.Path]::GetPathRoot($fullPath)) {
+        throw 'A task path must identify a file or subdirectory, not a drive or share root.'
+    }
+    $fullPath.TrimEnd([char[]]'\/')
+}
+
 function Assert-OwnedTask {
     param([Parameter(Mandatory = $true)]$Task)
 
@@ -37,10 +51,38 @@ function Assert-OwnedTask {
     }
     $command = $actions[0].SelectSingleNode('t:Command', $namespaces)
     $arguments = $actions[0].SelectSingleNode('t:Arguments', $namespaces)
-    if ($actions[0].LocalName -ne 'Exec' -or $null -eq $command -or $null -eq $arguments -or
-        [IO.Path]::GetFileName($command.InnerText) -ine 'pythonw.exe' -or
-        $arguments.InnerText -notmatch '^-m screenshotinone --config "[^"]+" watch$') {
+    $workingDirectory = $actions[0].SelectSingleNode('t:WorkingDirectory', $namespaces)
+    if ($actions[0].LocalName -ne 'Exec' -or $null -eq $command -or $null -eq $arguments -or $null -eq $workingDirectory) {
         throw "Task '$TaskName' has an unexpected action. Refusing to replace it."
+    }
+    $executable = ConvertTo-TaskPath $command.InnerText
+    $workingRoot = ConvertTo-TaskPath $workingDirectory.InnerText
+    $legacy = [regex]::Match($arguments.InnerText, '^-m screenshotinone --config "(?<config>[^"]+)" watch$')
+    if ([IO.Path]::GetFileName($executable) -ieq 'pythonw.exe' -and $legacy.Success) {
+        $null = ConvertTo-TaskPath $legacy.Groups['config'].Value
+        return
+    }
+    $native = [regex]::Match($arguments.InnerText, '^--python "(?<python>[^"]+)" --project "(?<project>[^"]+)" --config "(?<config>[^"]+)" --debounce-ms (?<delay>[0-9]+)(?<roots>(?: --root "[^"]+")+)$')
+    if ([IO.Path]::GetFileName($executable) -notmatch '^ScreenshotWatcher-[0-9a-f]{16}\.exe$' -or -not $native.Success) {
+        throw "Task '$TaskName' has an unexpected watcher action. Refusing to replace it."
+    }
+    $nativePython = ConvertTo-TaskPath $native.Groups['python'].Value
+    $nativeProject = ConvertTo-TaskPath $native.Groups['project'].Value
+    $nativeConfig = ConvertTo-TaskPath $native.Groups['config'].Value
+    $expectedBin = Join-Path ([IO.Path]::GetDirectoryName($nativeConfig)) 'bin'
+    $delay = 0
+    $validDelay = [int]::TryParse($native.Groups['delay'].Value, [ref]$delay)
+    $rootArguments = [regex]::Matches($native.Groups['roots'].Value, ' --root "(?<path>[^"]+)"')
+    if ([IO.Path]::GetFileName($nativePython) -ine 'pythonw.exe' -or $nativeProject -ine $workingRoot -or
+        [IO.Path]::GetDirectoryName($executable) -ine $expectedBin -or -not $validDelay -or
+        $delay -lt 1 -or $rootArguments.Count -gt 32) {
+        throw "Task '$TaskName' has inconsistent watcher paths or options. Refusing to replace it."
+    }
+    foreach ($rootArgument in $rootArguments) {
+        $rootPath = ConvertTo-TaskPath $rootArgument.Groups['path'].Value
+        if ([IO.Path]::GetFileName($rootPath) -ine 'userdata') {
+            throw "Task '$TaskName' watches an unexpected directory. Refusing to replace it."
+        }
     }
 }
 
@@ -88,13 +130,17 @@ if ([string]::IsNullOrWhiteSpace($PythonPath)) {
     $PythonPath = (Get-Command python.exe -ErrorAction Stop).Source
 }
 $pythonItem = Get-Item -LiteralPath $PythonPath
-if ($pythonItem.PSIsContainer) {
-    throw '-PythonPath must point to a Python executable.'
+if ($pythonItem.PSIsContainer -or $pythonItem.Name -notin @('python.exe', 'pythonw.exe')) {
+    throw '-PythonPath must point to python.exe or pythonw.exe.'
 }
 $pythonw = Join-Path $pythonItem.DirectoryName 'pythonw.exe'
-if (-not (Test-Path -LiteralPath $pythonw -PathType Leaf)) {
-    throw "pythonw.exe was not found beside '$PythonPath'. Pass -PythonPath for a Windows Python installation."
+$pythonConsole = Join-Path $pythonItem.DirectoryName 'python.exe'
+if (-not (Test-Path -LiteralPath $pythonw -PathType Leaf) -or -not (Test-Path -LiteralPath $pythonConsole -PathType Leaf)) {
+    throw "Both python.exe and pythonw.exe must exist beside '$PythonPath'. Pass a Windows Python installation."
 }
+$resolvedConfig = ConvertTo-TaskPath $resolvedConfig
+$projectRoot = ConvertTo-TaskPath $projectRoot
+$pythonw = ConvertTo-TaskPath $pythonw
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $userSid = $identity.User.Value
@@ -112,7 +158,49 @@ if ($null -ne $existingTask) {
     Assert-OwnedTask -Task $existingTask
 }
 
-$arguments = '-m screenshotinone --config "' + $resolvedConfig + '" watch'
+# Resolve and validate the read-only plan before compiling or stopping anything.
+Push-Location -LiteralPath $projectRoot
+try {
+    $planLines = @(& $pythonConsole -m screenshotinone --config $resolvedConfig watch-plan)
+    if ($LASTEXITCODE -ne 0) { throw "Could not read the screenshot watcher plan (Python exit $LASTEXITCODE)." }
+    $plan = ($planLines -join "`n") | ConvertFrom-Json
+} finally {
+    Pop-Location
+}
+if ($plan.enabled -isnot [bool] -or -not $plan.enabled) {
+    throw 'No synchronization destination is enabled. Enable a destination before installing startup.'
+}
+if (($plan.debounce_ms -isnot [int] -and $plan.debounce_ms -isnot [long]) -or
+    $plan.debounce_ms -lt 1 -or $plan.debounce_ms -gt [int]::MaxValue -or
+    $plan.roots -isnot [System.Array] -or $plan.roots.Count -lt 1 -or $plan.roots.Count -gt 32) {
+    throw 'The watcher plan must contain 1-32 userdata roots and a positive Int32 debounce_ms.'
+}
+$watchRoots = @($plan.roots | ForEach-Object {
+    if ($_ -isnot [string]) { throw 'Watcher roots must be absolute paths.' }
+    $rootItem = Get-Item -LiteralPath $_
+    if (-not $rootItem.PSIsContainer -or $rootItem.Name -ine 'userdata') {
+        throw 'Watcher roots must identify existing Steam userdata directories.'
+    }
+    ConvertTo-TaskPath $rootItem.FullName
+} | Select-Object -Unique)
+$binDirectory = Join-Path ([IO.Path]::GetDirectoryName($resolvedConfig)) 'bin'
+$buildScript = Join-Path $PSScriptRoot 'build-watcher.ps1'
+if ($WhatIfPreference) {
+    $null = $PSCmdlet.ShouldProcess($TaskName, 'Build and register native screenshotinone watcher at user logon')
+    return
+}
+$built = @(& $buildScript -OutputDirectory $binDirectory)
+if ($built.Count -ne 1 -or $built[0] -isnot [string]) { throw 'The watcher build did not return exactly one executable path.' }
+$watcher = ConvertTo-TaskPath $built[0]
+if ([IO.Path]::GetDirectoryName($watcher) -ine $binDirectory -or
+    [IO.Path]::GetFileName($watcher) -notmatch '^ScreenshotWatcher-[0-9a-f]{16}\.exe$' -or
+    -not (Test-Path -LiteralPath $watcher -PathType Leaf)) {
+    throw 'The watcher build returned an unexpected executable.'
+}
+# These validated paths contain neither quotes nor trailing separators, so
+# Windows command-line quoting is unambiguous and no shell is involved.
+$arguments = '--python "' + $pythonw + '" --project "' + $projectRoot + '" --config "' + $resolvedConfig + '" --debounce-ms ' + $plan.debounce_ms
+foreach ($watchRoot in $watchRoots) { $arguments += ' --root "' + $watchRoot + '"' }
 $taskXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -160,7 +248,7 @@ $taskXml = @"
   </Settings>
   <Actions Context="CurrentUser">
     <Exec>
-      <Command>$(ConvertTo-XmlText $pythonw)</Command>
+      <Command>$(ConvertTo-XmlText $watcher)</Command>
       <Arguments>$(ConvertTo-XmlText $arguments)</Arguments>
       <WorkingDirectory>$(ConvertTo-XmlText $projectRoot)</WorkingDirectory>
     </Exec>
@@ -184,7 +272,10 @@ if ($PSCmdlet.ShouldProcess($TaskName, 'Register silent screenshotinone task at 
         TaskName = $TaskName
         ConfigPath = $resolvedConfig
         PythonPath = $pythonw
+        WatcherPath = $watcher
         WorkingDirectory = $projectRoot
+        WatchRoots = $watchRoots
+        DebounceMilliseconds = $plan.debounce_ms
         StartRequested = [bool]$StartNow
     }
 }

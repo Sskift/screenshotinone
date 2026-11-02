@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "screenshotinone"
-version = "0.2.0"
+version = "0.3.0"
 description = "Quietly sync Steam screenshots to Netclip, cloud folders, and Steam Community."
 readme = "README.md"
 requires-python = ">=3.11"
