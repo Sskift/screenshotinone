@@ -1,0 +1,11 @@
+{
+  "steam_roots": [],
+  "target": {
+    "type": "netclip",
+    "url": "http://netclip-host:3210",
+    "folder": "Steam Screenshots",
+    "timeout": 30
+  },
+  "poll_interval": 15,
+  "settle_seconds": 3
+}

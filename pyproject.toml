@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "screenshotinone"
+version = "0.1.0"
+description = "Quietly sync Steam screenshots to Netclip Drive or a cloud-synced folder."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Sskift"}]
+dependencies = []
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: Microsoft :: Windows",
+  "Topic :: Utilities",
+]
+
+[project.scripts]
+screenshotinone = "screenshotinone.cli:main"
+
+[project.urls]
+Repository = "https://github.com/Sskift/screenshotinone"
+Issues = "https://github.com/Sskift/screenshotinone/issues"
+
+[tool.setuptools.packages.find]
+include = ["screenshotinone*"]

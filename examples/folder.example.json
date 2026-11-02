@@ -1,0 +1,9 @@
+{
+  "steam_roots": [],
+  "target": {
+    "type": "folder",
+    "path": "~/OneDrive/Steam Screenshots"
+  },
+  "poll_interval": 15,
+  "settle_seconds": 3
+}
