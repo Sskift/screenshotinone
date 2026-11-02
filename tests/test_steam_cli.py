@@ -53,6 +53,29 @@ class SteamCliTests(unittest.TestCase):
         del self.data["steam"]
         self.save()
         self.assertIsNone(Config.load(self.path).steam)
+        self.assertTrue(Config.load(self.path).target_enabled)
+
+    def test_disabled_cloud_target_is_not_constructed_or_synced_but_steam_runs(self):
+        self.data["target"] = {"type": "netclip", "url": "http://127.0.0.1:3210", "enabled": False}
+        self.save()
+        for arguments in (("sync",), ("sync", "--dry-run")):
+            with self.subTest(arguments=arguments):
+                with patch("screenshotinone.cli._target") as target:
+                    with patch("screenshotinone.cli.sync_once") as cloud_sync:
+                        with patch("screenshotinone.cli._steam_pass", return_value=Report()) as steam:
+                            code, output, _ = self.command(*arguments)
+                self.assertEqual(code, 0)
+                self.assertFalse(output["target_enabled"])
+                target.assert_not_called()
+                cloud_sync.assert_not_called()
+                steam.assert_called_once()
+        self.assertFalse((self.base / "state.sqlite3").exists())
+
+    def test_target_enabled_requires_a_boolean(self):
+        self.data["target"]["enabled"] = "false"
+        self.save()
+        with self.assertRaisesRegex(ValueError, "target.enabled"):
+            Config.load(self.path)
 
     def test_config_defaults_to_private_without_historical_publication(self):
         self.data["steam"].pop("visibility")

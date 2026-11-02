@@ -181,7 +181,7 @@ def _logger(config: Config) -> logging.Logger:
 def _run(config: Config, *, watch: bool, dry_run: bool = False) -> int:
     logger = _logger(config) if not dry_run else None
     roots = _roots(config)
-    target = _target(config)
+    target = _target(config) if config.target_enabled else None
     stop = threading.Event()
     if watch:
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -189,21 +189,22 @@ def _run(config: Config, *, watch: bool, dry_run: bool = False) -> int:
         logger.info("Worker started; polling every %s seconds", config.poll_interval)
     last_summary = None
     while True:
-        summary = {"dry_run": dry_run}
+        summary = {"dry_run": dry_run, "target_enabled": config.target_enabled}
         exit_code = 0
         changed = False
-        try:
-            report = sync_once(roots, target, config.state_path,
-                               settle_seconds=config.settle_seconds, dry_run=dry_run)
-            summary.update(dataclasses.asdict(report))
-            folder_url = getattr(target, "folder_url", None)
-            if folder_url:
-                summary["folder_url"] = folder_url
-            exit_code = 1 if report.errors else 0
-            changed = bool(report.uploaded)
-        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
-            summary["errors"] = [str(exc)]
-            exit_code = 1
+        if target is not None:
+            try:
+                report = sync_once(roots, target, config.state_path,
+                                   settle_seconds=config.settle_seconds, dry_run=dry_run)
+                summary.update(dataclasses.asdict(report))
+                folder_url = getattr(target, "folder_url", None)
+                if folder_url:
+                    summary["folder_url"] = folder_url
+                exit_code = 1 if report.errors else 0
+                changed = bool(report.uploaded)
+            except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                summary["errors"] = [str(exc)]
+                exit_code = 1
         if config.steam and config.steam.enabled:
             try:
                 steam_report = _steam_pass(config, dry_run=dry_run)
@@ -249,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
             roots = _roots(config)
             _print({"version": __version__, "config": config.path, "steam_roots": roots,
                     "screenshots": len(scan_screenshots(roots)), "target": config.target_type,
+                    "target_enabled": config.target_enabled,
                     "state_path": config.state_path, "state_exists": config.state_path.exists(),
                     "log_path": config.log_path, "poll_interval": config.poll_interval,
                     "steam_enabled": bool(config.steam and config.steam.enabled)})

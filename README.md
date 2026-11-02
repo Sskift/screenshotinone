@@ -48,6 +48,8 @@ python -m screenshotinone init --target folder --destination "$env:USERPROFILE\O
 
 更多配置见 [Netclip 示例](examples/netclip.example.json) 和 [文件夹示例](examples/folder.example.json)。`steam_roots` 为空时自动发现；也可指定 Steam 安装目录，或在 `init` 时传入 `--steam-root`。路径相对于配置文件解析，支持 `~` 和环境变量。Linux 默认使用 `$XDG_CONFIG_HOME/screenshotinone`，否则使用 `~/.config/screenshotinone`。
 
+只需要 Steam 自动上传时，在原有 `target` 对象内添加 `"enabled": false`，保留 `steam.enabled: true`，然后重启 screenshotinone worker。关闭目标后不会连接 Netclip 或执行文件夹复制，已有目标配置和同步记录会保留；恢复时将 `target.enabled` 改回 `true`。省略此字段时默认开启。
+
 ## Steam 社区发布（实验功能）
 
 此功能调用 Steam 客户端内部接口，可能随 Steam 更新变化。先安装可选依赖并运行只读诊断：

@@ -99,6 +99,7 @@ class Config:
     poll_interval: float
     settle_seconds: float
     steam: SteamConfig | None = None
+    target_enabled: bool = True
 
     @classmethod
     def load(cls, path: Path) -> Config:
@@ -116,9 +117,12 @@ class Config:
         target = data.get("target")
         if not isinstance(target, dict):
             raise ValueError("target must be an object")
+        target_enabled = target.get("enabled", True)
+        if not isinstance(target_enabled, bool):
+            raise ValueError("target.enabled must be a boolean")
         kind = target.get("type")
         if kind == "netclip":
-            if set(target) - {"type", "url", "folder", "timeout"}:
+            if set(target) - {"type", "url", "folder", "timeout", "enabled"}:
                 raise ValueError("Unknown Netclip target option")
             url = target.get("url", "")
             if not isinstance(url, str):
@@ -142,7 +146,7 @@ class Config:
             options = {"base_url": url.rstrip("/"), "folder_name": folder.strip(),
                        "timeout": _number(target, "timeout", 30, 1)}
         elif kind == "folder":
-            if set(target) - {"type", "path"}:
+            if set(target) - {"type", "path", "enabled"}:
                 raise ValueError("Unknown folder target option")
             dest = target.get("path")
             if not isinstance(dest, str) or not dest.strip():
@@ -167,4 +171,5 @@ class Config:
             poll_interval=_number(data, "poll_interval", 15, 1),
             settle_seconds=_number(data, "settle_seconds", 3, 0),
             steam=steam,
+            target_enabled=target_enabled,
         )
