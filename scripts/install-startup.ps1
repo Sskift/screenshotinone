@@ -49,6 +49,32 @@ function ConvertTo-XmlText {
     [System.Security.SecurityElement]::Escape($Value)
 }
 
+function Stop-TaskAndWait {
+    param([Parameter(Mandatory = $true)]$Task)
+
+    # GetInstances(0) can omit hidden tasks. Include them explicitly, and retain
+    # process handles so a reused process ID cannot confuse the exit check.
+    $running = @($service.GetRunningTasks(1) | Where-Object { $_.Path -eq "\$TaskName" })
+    $processes = @($running | ForEach-Object {
+        $engine = Get-Process -Id $_.EnginePID -ErrorAction SilentlyContinue
+        if ($null -ne $engine) { $null = $engine.Handle; $engine }
+    })
+    try { $Task.Stop(0) } catch {
+        if ($_.Exception.GetBaseException().HResult -ne -2147216629) { throw }
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+        $active = @($service.GetRunningTasks(1) | Where-Object { $_.Path -eq "\$TaskName" })
+        $alive = @($processes | Where-Object { -not $_.HasExited })
+        $state = $taskFolder.GetTask($TaskName).State
+        if ($active.Count -eq 0 -and $alive.Count -eq 0 -and $state -ne 4 -and $state -ne 2) {
+            return
+        }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Task '$TaskName' did not stop within 15 seconds. Its definition was not replaced."
+}
+
 $configItem = Get-Item -LiteralPath $ConfigPath
 if ($configItem.PSIsContainer) {
     throw '-ConfigPath must point to a configuration file.'
@@ -143,17 +169,15 @@ $taskXml = @"
 "@
 
 if ($PSCmdlet.ShouldProcess($TaskName, 'Register silent screenshotinone task at user logon')) {
+    if ($StartNow -and $null -ne $existingTask) {
+        # Stop the old definition before replacement; otherwise IgnoreNew can
+        # refuse the new run while the previous process continues unchanged.
+        Stop-TaskAndWait -Task $existingTask
+    }
     # TASK_CREATE_OR_UPDATE=6; TASK_LOGON_INTERACTIVE_TOKEN=3.
     $registeredTask = $taskFolder.RegisterTask($TaskName, $taskXml, 6, $userSid, $null, 3, $null)
     Assert-OwnedTask -Task $registeredTask
     if ($StartNow) {
-        # Apply updated settings immediately, including a changed config path.
-        if ($registeredTask.GetInstances(0).Count -gt 0) {
-            try { $registeredTask.Stop(0) } catch {
-                # An instance can exit between GetInstances and Stop.
-                if ($_.Exception.GetBaseException().HResult -ne -2147216629) { throw }
-            }
-        }
         $null = $registeredTask.Run($null)
     }
     [pscustomobject]@{

@@ -33,7 +33,9 @@ class EngineTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.base = Path(self.temp.name)
+        # Windows CI may return a DOS short path (RUNNER~1) from tempfile;
+        # discovery resolves it to the long name before our fault injection.
+        self.base = Path(self.temp.name).resolve()
         self.root = self.base / "Steam"
         self.original = self.root / "userdata/123/760/remote/456/screenshots/one.png"
         self.original.parent.mkdir(parents=True)

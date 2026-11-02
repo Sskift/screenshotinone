@@ -44,11 +44,28 @@ if ($actions[0].LocalName -ne 'Exec' -or $null -eq $command -or $null -eq $argum
 
 if ($PSCmdlet.ShouldProcess($TaskName, 'Stop and remove screenshotinone startup task')) {
     # Stop only instances belonging to this verified task. Do not kill Python by name.
-    if ($task.GetInstances(0).Count -gt 0) {
-        try { $task.Stop(0) } catch {
-            if ($_.Exception.GetBaseException().HResult -ne -2147216629) { throw }
-        }
+    # TASK_ENUM_HIDDEN=1 is essential because our task has Hidden=true.
+    $running = @($service.GetRunningTasks(1) | Where-Object { $_.Path -eq "\$TaskName" })
+    $processes = @($running | ForEach-Object {
+        $engine = Get-Process -Id $_.EnginePID -ErrorAction SilentlyContinue
+        if ($null -ne $engine) { $null = $engine.Handle; $engine }
+    })
+    try { $task.Stop(0) } catch {
+        if ($_.Exception.GetBaseException().HResult -ne -2147216629) { throw }
     }
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+        $active = @($service.GetRunningTasks(1) | Where-Object { $_.Path -eq "\$TaskName" })
+        $alive = @($processes | Where-Object { -not $_.HasExited })
+        $state = $taskFolder.GetTask($TaskName).State
+        if ($active.Count -eq 0 -and $alive.Count -eq 0 -and $state -ne 4 -and $state -ne 2) {
+            break
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            throw "Task '$TaskName' did not stop within 15 seconds. Its definition was not removed."
+        }
+        Start-Sleep -Milliseconds 200
+    } while ($true)
     $taskFolder.DeleteTask($TaskName, 0)
     Write-Output "Removed task '$TaskName'. Configuration and sync history were preserved."
 }
