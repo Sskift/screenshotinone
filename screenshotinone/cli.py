@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 
 from . import __version__
-from .config import Config, default_config_path
+from .config import Config, SteamConfig, default_config_path
 from .engine import sync_once
 from .source import discover_steam_roots, scan_screenshots
 from .targets import FolderTarget, NetclipTarget
@@ -41,6 +41,19 @@ def _parser() -> argparse.ArgumentParser:
     sync.add_argument("--dry-run", action="store_true", help="Plan without uploading or changing state")
     commands.add_parser("watch", help="Poll for new screenshots; retry failed files on later passes")
     commands.add_parser("status", help="Show source counts and local worker log location")
+    steam = commands.add_parser("steam", help="Experimental Steam Community publication through the local Steam client")
+    steam_commands = steam.add_subparsers(dest="steam_command", required=True)
+    doctor = steam_commands.add_parser("doctor", help="Read-only check of Steam's local debugging interface and account")
+    doctor.add_argument("--endpoint", help="Local Steam CDP HTTP origin (numeric loopback only)")
+    steam_commands.add_parser("status", help="Read the durable publication queue without connecting to Steam")
+    steam_sync = steam_commands.add_parser("sync", help="Run one Steam-only publication pass")
+    steam_sync.add_argument("--dry-run", action="store_true")
+    steam_sync.add_argument("--include-existing", action="store_true", help="Explicitly include historical screenshots")
+    steam_sync.add_argument("--limit", type=int, help="Maximum number of upload calls this pass")
+    publish = steam_commands.add_parser("publish", help="Publish one explicitly selected Steam screenshot")
+    publish.add_argument("--file", type=Path, required=True)
+    publish.add_argument("--visibility", choices=("private", "friends", "public", "unlisted"))
+    publish.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -84,6 +97,73 @@ def _target(config: Config):
     return NetclipTarget(**config.target_options) if config.target_type == "netclip" else FolderTarget(**config.target_options)
 
 
+def _steam_pass(config: Config, *, dry_run: bool = False, include_existing: bool = False,
+                only_path: Path | None = None, visibility: str | None = None, limit: int | None = None):
+    from .cdp import SteamCDP
+    from .steam_bridge import SteamBridge
+    from .steam_sync import steam_sync_once
+
+    settings = config.steam
+    if settings is None or settings.account_id is None:
+        raise ValueError("Configure steam.account_id before publishing; run steam doctor to identify the logged-in account.")
+    if limit is not None and limit <= 0:
+        raise ValueError("--limit must be a positive integer")
+    bridge = SteamBridge(SteamCDP(settings.endpoint, timeout=settings.timeout), timeout=settings.timeout)
+    try:
+        return steam_sync_once(
+            _roots(config), bridge, settings.state_path,
+            account_id=settings.account_id, visibility=visibility or settings.visibility,
+            include_existing=include_existing or settings.include_existing, dry_run=dry_run,
+            limit=limit, only_path=only_path,
+            settle_seconds=config.settle_seconds, confirm_timeout=settings.confirm_timeout,
+        )
+    finally:
+        bridge.close()
+
+
+def _steam_command(args: argparse.Namespace, config: Config | None) -> int:
+    settings = config.steam if config and config.steam else SteamConfig()
+    if args.steam_command == "doctor":
+        from .cdp import SteamCDP
+        from .steam_bridge import SteamBridge
+
+        bridge = SteamBridge(SteamCDP(args.endpoint or settings.endpoint, timeout=settings.timeout), timeout=settings.timeout)
+        try:
+            details = bridge.doctor()
+            account = details.get("account_id")
+            matches = settings.account_id is None or settings.account_id == account
+            _print({**details, "read_only": True, "configured_account_id": settings.account_id,
+                    "account_matches": matches, "automatic_enabled": settings.enabled})
+            return 0 if details.get("ready") is True and matches else 1
+        except (OSError, RuntimeError, ValueError) as exc:
+            _print({"available": False, "read_only": True, "error": str(exc),
+                    "next": "Start Steam with -cef-enable-debugging, then retry. No Steam restart or publication was performed."})
+            return 1
+        finally:
+            bridge.close()
+    if args.steam_command == "status":
+        from .steam_sync import steam_queue_status
+
+        state_path = settings.state_path or args.config.parent / "steam-state.sqlite3"
+        _print({"automatic_enabled": settings.enabled, "visibility": settings.visibility,
+                "account_id": settings.account_id, "state_path": state_path,
+                "queue": steam_queue_status(state_path, account_id=settings.account_id)})
+        return 0
+    if config is None:
+        raise ValueError("Configuration not found. Configure the Steam account and destination first.")
+    manual = args.steam_command == "publish"
+    report = _steam_pass(config, dry_run=args.dry_run,
+                         include_existing=manual or getattr(args, "include_existing", False),
+                         only_path=args.file.expanduser().resolve() if manual else None,
+                         visibility=getattr(args, "visibility", None),
+                         limit=1 if manual else args.limit)
+    summary = {**dataclasses.asdict(report), "dry_run": args.dry_run}
+    _print(summary)
+    if not args.dry_run:
+        _logger(config).info("Steam sync: %s", json.dumps(summary, ensure_ascii=False, default=str))
+    return 1 if report.errors or report.uncertain else 0
+
+
 def _logger(config: Config) -> logging.Logger:
     config.log_path.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("screenshotinone")
@@ -109,25 +189,36 @@ def _run(config: Config, *, watch: bool, dry_run: bool = False) -> int:
         logger.info("Worker started; polling every %s seconds", config.poll_interval)
     last_summary = None
     while True:
+        summary = {"dry_run": dry_run}
+        exit_code = 0
+        changed = False
         try:
             report = sync_once(roots, target, config.state_path,
                                settle_seconds=config.settle_seconds, dry_run=dry_run)
-            summary = dataclasses.asdict(report)
-            summary["dry_run"] = dry_run
+            summary.update(dataclasses.asdict(report))
             folder_url = getattr(target, "folder_url", None)
             if folder_url:
                 summary["folder_url"] = folder_url
-            if not watch or summary != last_summary or report.uploaded or report.errors:
-                _print(summary)
-                if logger:
-                    logger.info("Sync: %s", json.dumps(summary, ensure_ascii=False, default=str))
-            last_summary = summary
             exit_code = 1 if report.errors else 0
+            changed = bool(report.uploaded)
         except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
-            if not watch:
-                raise
-            logger.error("Sync pass failed: %s", exc)
+            summary["errors"] = [str(exc)]
             exit_code = 1
+        if config.steam and config.steam.enabled:
+            try:
+                steam_report = _steam_pass(config, dry_run=dry_run)
+                summary["steam"] = dataclasses.asdict(steam_report)
+                changed = changed or bool(steam_report.uploaded)
+                if steam_report.errors or steam_report.uncertain:
+                    exit_code = 1
+            except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                summary["steam"] = {"errors": [str(exc)]}
+                exit_code = 1
+        if not watch or summary != last_summary or changed:
+            _print(summary)
+            if logger:
+                logger.info("Sync: %s", json.dumps(summary, ensure_ascii=False, default=str))
+        last_summary = summary
         if not watch:
             return exit_code
         if stop.wait(config.poll_interval):
@@ -143,6 +234,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "init":
             return _init(args)
         config = Config.load(args.config) if args.config.exists() else None
+        if args.command == "steam":
+            return _steam_command(args, config)
         if args.command == "scan":
             roots = _roots(config)
             screenshots = scan_screenshots(roots)
@@ -157,7 +250,8 @@ def main(argv: list[str] | None = None) -> int:
             _print({"version": __version__, "config": config.path, "steam_roots": roots,
                     "screenshots": len(scan_screenshots(roots)), "target": config.target_type,
                     "state_path": config.state_path, "state_exists": config.state_path.exists(),
-                    "log_path": config.log_path, "poll_interval": config.poll_interval})
+                    "log_path": config.log_path, "poll_interval": config.poll_interval,
+                    "steam_enabled": bool(config.steam and config.steam.enabled)})
             return 0
         return _run(config, watch=args.command == "watch", dry_run=getattr(args, "dry_run", False))
     except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
